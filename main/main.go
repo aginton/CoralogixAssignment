@@ -6,39 +6,77 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
-const ChunkSize = 500 // Adjust based on your needs and memory constraints
+const ChunkSize = 500
 
-// TableOperation is a function type that represents a table transformation.
-type TableOperation func(data [][]string, startIndex int) [][]string
+type OperationType int
 
-// Pipeline structure holds the input filename and a list of operations to execute.
-type Pipeline struct {
-	filePath   string
-	operations []TableOperation
-	chunkSize  int
+const (
+	FilterOperation OperationType = iota
+	TransformOperation
+)
+
+type Operation struct {
+	OpType  OperationType
+	Execute func(data [][]string, rowOffset int) ([][]string, error)
 }
 
-// Read initializes a pipeline with the given input file.
+type Pipeline struct {
+	filePath        string
+	filters         []Operation
+	transformations []Operation
+	chunkSize       int
+	tempFiles       []string
+}
+
 func Read(filePath string) *Pipeline {
 	return &Pipeline{
-		filePath:   filePath,
-		operations: []TableOperation{},
-		chunkSize:  ChunkSize,
+		filePath:        filePath,
+		filters:         []Operation{},
+		transformations: []Operation{},
+		chunkSize:       ChunkSize,
 	}
 }
 
 // Add an operation to the pipeline.
-func (p *Pipeline) With(operation TableOperation) *Pipeline {
-	p.operations = append(p.operations, operation)
+func (p *Pipeline) With(operation Operation) *Pipeline {
+	if operation.OpType == FilterOperation {
+		p.filters = append(p.filters, operation)
+	} else {
+		p.transformations = append(p.transformations, operation)
+	}
 	return p
 }
 
 // Write the processed data to an output file, skipping empty rows.
 func (p *Pipeline) Write(outputPath string) error {
-	inputFile, err := os.Open(p.filePath)
+	tempFilteredFile := "temp_filtered.csv"
+	err := p.applyFilters(tempFilteredFile)
+	if err != nil {
+		return err
+	}
+
+	err = p.applyTransformations(tempFilteredFile, outputPath)
+	if err != nil {
+		return err
+	}
+
+	os.Remove(tempFilteredFile)
+	return nil
+}
+
+// Helper function to apply a sequence of operations and write the result to final file using temporary files
+func processOperationsInChunksAndWriteToFile(
+	inputFilePath string,
+	outputFilePath string,
+	chunkSize int,
+	operations []Operation,
+	tempFilePrefix string) error {
+
+	inputFile, err := os.Open(inputFilePath)
 	if err != nil {
 		return err
 	}
@@ -46,54 +84,78 @@ func (p *Pipeline) Write(outputPath string) error {
 
 	reader := csv.NewReader(inputFile)
 	var wg sync.WaitGroup
-	tempFiles := []string{} // to store the names of temporary files in order
+	tempFiles := []string{}
 	globalRowIndex := 0
+	sequence := 0
 
-	// Process data in chunks and write each chunk to a temporary file
-	for idx := 0; ; idx++ {
-		chunk, err := readChunk(reader, p.chunkSize)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-
-		tempFileName := fmt.Sprintf("temp_%d.csv", idx) // Sequentially named file
-		tempFile, err := os.Create(tempFileName)
-		fmt.Printf("Created temporary file %s\n", tempFileName)
-		if err != nil {
-			return err
-		}
-		tempFiles = append(tempFiles, tempFileName)
-
-		wg.Add(1)
-		chunkStartIndex := globalRowIndex // Capture the start index for this chunk
-		go func(file *os.File, chunk [][]string, startIndex int) {
-			defer wg.Done()
-			defer file.Close()
-
-			for _, op := range p.operations {
-				chunk = op(chunk, startIndex)
-			}
-			writer := csv.NewWriter(file)
-			// Write non-empty records to the temporary file
-			for _, record := range chunk {
-				if !isEmptyRow(record) { // Check if the row is empty
-					if err := writer.Write(record); err != nil {
-						fmt.Println("Error writing to temp file:", err)
-						break
-					}
+	for {
+		// Read a chunk of data
+		chunk, readErr := readChunk(reader, chunkSize)
+		originalChunkLen := len(chunk)
+		if len(chunk) > 0 {
+			// Apply each operation in the sequence
+			for _, operation := range operations {
+				var opErr error
+				chunk, opErr = operation.Execute(chunk, globalRowIndex)
+				if opErr != nil {
+					return opErr
 				}
 			}
-			writer.Flush()
-		}(tempFile, chunk, chunkStartIndex)
-		globalRowIndex += len(chunk)
+			globalRowIndex += originalChunkLen
+
+			// Write the processed chunk to a temporary file if not empty
+			if len(chunk) > 0 {
+				tempFileName := fmt.Sprintf("%s_chunk_%d.csv", tempFilePrefix, sequence)
+				tempFiles = append(tempFiles, tempFileName)
+				sequence++
+
+				tempFile, err := os.Create(tempFileName)
+				if err != nil {
+					return err
+				}
+
+				wg.Add(1)
+				go func(file *os.File, data [][]string) {
+					defer wg.Done()
+					defer file.Close()
+					writeChunk(file, data)
+				}(tempFile, chunk)
+			}
+		}
+
+		if readErr == io.EOF {
+			break
+		} else if readErr != nil {
+			return readErr
+		}
 	}
 
 	wg.Wait()
 
-	// Merge all temporary files into a single output file
-	outputFile, err := os.Create(outputPath)
+	// Merge all temporary files into the final output file
+	return mergeAndRemoveTemporaryFiles(tempFiles, outputFilePath)
+}
+
+func (p *Pipeline) applyFilters(outputFilePath string) error {
+	return processOperationsInChunksAndWriteToFile(
+		p.filePath,     // Use input file path from the pipeline
+		outputFilePath, // Output file path
+		p.chunkSize,    // Chunk size
+		p.filters,      // Operations to apply (filters)
+		"filtered")     // Prefix for temporary files
+}
+
+func (p *Pipeline) applyTransformations(inputFilePath, outputFilePath string) error {
+	return processOperationsInChunksAndWriteToFile(
+		inputFilePath,     // Use provided input file path
+		outputFilePath,    // Output file path
+		p.chunkSize,       // Chunk size
+		p.transformations, // Operations to apply (transformations)
+		"transformed")     // Prefix for temporary files
+}
+
+func mergeAndRemoveTemporaryFiles(tempFiles []string, finalFilePath string) error {
+	outputFile, err := os.Create(finalFilePath)
 	if err != nil {
 		return err
 	}
@@ -101,15 +163,26 @@ func (p *Pipeline) Write(outputPath string) error {
 
 	writer := csv.NewWriter(outputFile)
 	for _, tempFile := range tempFiles {
-		if err := mergeTempFile(writer, tempFile); err != nil {
-			fmt.Println("err occurred when merging temp file")
+		inputFile, err := os.Open(tempFile)
+		if err != nil {
 			return err
 		}
-		fmt.Println("Removing temporary file " + tempFile)
-		os.Remove(tempFile) // Remove temporary file after merging
+		reader := csv.NewReader(inputFile)
+
+		for {
+			record, err := reader.Read()
+			if err == io.EOF {
+				inputFile.Close()
+				break // Finish reading this temporary file
+			} else if err != nil {
+				inputFile.Close()
+				return err // Handle read errors
+			}
+			writer.Write(record) // Write each record to the final output file
+		}
+		os.Remove(tempFile) // Clean up temporary files
 	}
 	writer.Flush()
-
 	return nil
 }
 
@@ -121,28 +194,6 @@ func isEmptyRow(row []string) bool {
 		}
 	}
 	return true
-}
-
-func mergeTempFile(writer *csv.Writer, filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-		if err := writer.Write(record); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Read a specific chunk from the CSV reader.
@@ -160,99 +211,126 @@ func readChunk(reader *csv.Reader, chunkSize int) ([][]string, error) {
 	return chunk, nil
 }
 
-// ForEveryColumn returns a table operation that applies a function to each cell in each row.
-func ForEveryColumn(transform func(string) string) TableOperation {
-	return func(data [][]string, index int) [][]string {
-		for i := range data {
-			for j := range data[i] {
-				data[i][j] = transform(data[i][j])
-			}
+func writeChunk(file *os.File, data [][]string) {
+	writer := csv.NewWriter(file)
+	for _, record := range data {
+		if !isEmptyRow(record) {
+			writer.Write(record)
 		}
-		return data
+	}
+	writer.Flush()
+}
+
+func ForEveryColumn(transformFunc func(string) string) Operation {
+	return Operation{
+		OpType: TransformOperation,
+		Execute: func(data [][]string, rowOffset int) ([][]string, error) {
+			for i, row := range data {
+				for j, cell := range row {
+					data[i][j] = transformFunc(cell)
+				}
+			}
+			return data, nil
+		},
 	}
 }
 
 // GetColumnRange filters a table to include only the columns within the specified range [start, end).
-func GetColumns(start, end int) TableOperation {
-	return func(data [][]string, index int) [][]string {
-		var result [][]string
-		for _, row := range data {
-			// Ensure that the start and end indices are within the row length
-			if start < 0 || start >= len(row) {
-				// If the start is out of bounds, consider it an empty row
-				result = append(result, []string{})
-				continue
+func GetColumns(start, end int) Operation {
+	return Operation{
+		OpType: FilterOperation,
+		Execute: func(data [][]string, rowOffset int) ([][]string, error) {
+			var result [][]string
+			for _, row := range data {
+				if start < 0 || start >= len(row) || end < start {
+					result = append(result, []string{})
+					continue
+				}
+				if end > len(row) {
+					end = len(row)
+				}
+				newRow := row[start:end]
+				result = append(result, newRow)
 			}
-			if end > len(row) {
-				end = len(row) // Limit end to the last index of the row
-			}
-			if end < start {
-				result = append(result, []string{})
-				continue
-			}
-			// Extract the sublist from start to end
-			newRow := row[start:end]
-			result = append(result, newRow)
-		}
-		return result
+			return result, nil
+		},
 	}
 }
 
-// GetRows filters rows within a specified range.
-func GetRows(start, end int) TableOperation {
-	return func(data [][]string, startIndex int) [][]string {
-		var result [][]string
-		for i, row := range data {
-			globalIndex := startIndex + i
-			if globalIndex >= start && globalIndex < end {
-				result = append(result, row)
+func GetRows(start, end int) Operation {
+	return Operation{
+		OpType: FilterOperation,
+		Execute: func(data [][]string, rowOffset int) ([][]string, error) {
+			if start < 0 {
+				return nil, fmt.Errorf("start index cannot be less than 0")
 			}
-		}
-		return result
+
+			// Determine the effective start and end indices within the chunk
+			effectiveStart := max(start-rowOffset, 0)     // Adjust start relative to the offset
+			effectiveEnd := min(end-rowOffset, len(data)) // Adjust end relative to the offset and limit to chunk size
+
+			// If the indices are valid and there is a range to return
+			if effectiveStart < effectiveEnd {
+				return data[effectiveStart:effectiveEnd], nil
+			}
+
+			// Return an empty slice if out of bounds
+			return [][]string{}, nil
+		},
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // SumRow returns a table operation that sums each column's values into a single row.
-func SumRow() TableOperation {
-	return func(data [][]string, index int) [][]string {
-		if len(data) == 0 {
-			return [][]string{}
-		}
-		sums := make([]int, len(data[0]))
-		for _, row := range data {
-			for i, cell := range row {
-				val, err := strconv.Atoi(cell)
-				if err == nil {
-					sums[i] += val
+func SumRow() Operation {
+	return Operation{OpType: TransformOperation,
+		Execute: func(data [][]string, startIndex int) ([][]string, error) {
+			if len(data) == 0 {
+				return [][]string{}, nil
+			}
+			sums := make([]int, len(data[0]))
+			for _, row := range data {
+				for i, cell := range row {
+					val, err := strconv.Atoi(cell)
+					if err == nil {
+						sums[i] += val
+					}
 				}
 			}
-		}
-		sumRow := make([]string, len(sums))
-		for i, sum := range sums {
-			sumRow[i] = strconv.Itoa(sum)
-		}
-		return [][]string{sumRow}
-	}
+			sumRow := make([]string, len(sums))
+			for i, sum := range sums {
+				sumRow[i] = strconv.Itoa(sum)
+			}
+			return [][]string{sumRow}, nil
+		}}
 }
 
 func main() {
 	Read("main/input.csv").
+		With(GetRows(1, 5)).
+		With(GetColumns(2, 5)).
 		With(ForEveryColumn(func(cell string) string {
-			n, _ := strconv.Atoi(cell)
-			return strconv.Itoa(n * 2)
+			n, err := strconv.Atoi(cell)
+			if err != nil {
+				// Handle the error properly, perhaps log it or use a default value
+				fmt.Println("Error converting cell ", cell)
+				return cell // Returning empty string or some default value in case of error
+			}
+			return strings.Repeat("h", n) // Correctly repeat "h" n times
+
 		})).
-		With(GetColumns(10, 15)).
-		With(GetRows(1, 20)).
-		//With(SumRow()).
 		Write("output.csv")
-
-	//Read("main/input.csv").
-	//	With(GetColumns(1, 4)).
-	//	With(GetRows(1, 5)).
-	//	Write("output.csv")
 }
-
-//Read("input.csv").With(ForEveryColumn(func(cell string) string {
-//	n, _ := strconv.Atoi(cell)
-//	return strconv.Itoa(n * 2)
-//})).With(GetColumns(3, 5)).With(GetRows(7, 20)).With(SumRow()).Write("output.csv")
