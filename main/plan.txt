@@ -1,0 +1,53 @@
+
+class Processor
+    void process(Row* in);
+    void flush();
+    Processor* With(???)
+    Write(string filename)
+
+class FilterProcessor: public Processor
+    FilterProcessor(lambda x, Processor* inner) {
+        _filter=x
+        _inner = inner;
+    }
+    void process(Row* in) {
+        if (_filter(in) {
+            _inner.process(in);
+        }
+    }
+
+class AvgProcessor: public Processor
+    AvgProcessor() {
+        sum=0
+        count=0
+        _inner = inner;
+    }
+    void process(Row* in) {
+        sum += row[0]
+        count+=1
+    }
+    void flush() {
+        _inner.process(Row(sum/count))
+    }
+
+class WriteProcessor: public Processor
+    WriteProcessor(fname) {
+        fname
+        _inner = inner;
+    }
+    void process(Row* in) {
+        file.write(in)
+    }
+
+
+
+a = WriteProcessor("nasdfasdf")
+b = FilterProcessor(lambda x: x%2==0, a)
+
+
+::read(Processor* p) {
+
+for row in reader.rows():
+    b.process(row)
+
+b.flush()
