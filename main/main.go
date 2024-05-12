@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 )
@@ -12,6 +13,19 @@ type Processor interface {
 	ProcessRow(row []string, rowIndex int) ([]string, error)
 	With(Processor) Processor
 	Next() Processor
+	Finalize() ([]string, error) // Ensure this is part of the interface
+	isAggregator() bool
+}
+
+func (bp *BaseProcessor) Finalize() ([]string, error) {
+	if bp.next != nil {
+		return bp.next.Finalize()
+	}
+	return nil, nil
+}
+
+func (bp *BaseProcessor) isAggregator() bool {
+	return false
 }
 
 type BaseProcessor struct {
@@ -213,6 +227,13 @@ func (dp *DataPipeline) Write(outputFilePath string) error {
 	writer := csv.NewWriter(outputFile)
 	defer writer.Flush()
 
+	hasAggregator := false
+	for proc := dp.processors; proc != nil; proc = proc.Next() {
+		if proc.isAggregator() {
+			hasAggregator = true
+		}
+	}
+
 	rowIndex := 0
 	for {
 		inputRow, err := reader.Read()
@@ -238,7 +259,7 @@ func (dp *DataPipeline) Write(outputFilePath string) error {
 			}
 		}
 
-		if !isEffectivelyEmpty(currentRow) {
+		if !hasAggregator && !isEffectivelyEmpty(currentRow) {
 			if err := writer.Write(currentRow); err != nil {
 				return fmt.Errorf("failed to write row %d: %v", rowIndex, err)
 			}
@@ -246,6 +267,32 @@ func (dp *DataPipeline) Write(outputFilePath string) error {
 		}
 
 		rowIndex++
+	}
+
+	if hasAggregator {
+		processingStarted := false
+		var currentRow []string
+		for proc := dp.processors; proc != nil; proc = proc.Next() {
+			if proc.isAggregator() {
+				processingStarted = true
+				currentRow, err = proc.Finalize()
+			}
+			if processingStarted {
+				currentRow, err = proc.ProcessRow(currentRow, rowIndex)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("After processing with %T: Row %d: %v\n", proc, rowIndex, currentRow)
+				if currentRow == nil {
+					fmt.Printf("Row %d resulted in nil and was skipped\n", rowIndex)
+					break
+				}
+			}
+		}
+		if err := writer.Write(currentRow); err != nil {
+			return fmt.Errorf("failed to write row %d: %v", rowIndex, err)
+		}
+		fmt.Printf("Written to file: Row %d: %v\n", rowIndex, currentRow)
 	}
 
 	return nil
@@ -268,6 +315,97 @@ func isEmptyRow(row []string) bool {
 		}
 	}
 	return true
+}
+
+// AvgProcessor computes the average for specified or all columns.
+type AvgProcessor struct {
+	BaseProcessor
+	columnIndices []int
+	sums          []int
+	counts        []int
+}
+
+// GetAvg creates a new AvgProcessor. If no column indices are provided, it averages all columns.
+func GetAvg(columnIndices ...int) Processor {
+	return &AvgProcessor{columnIndices: columnIndices}
+}
+
+func (p *AvgProcessor) ProcessRow(row []string, rowIndex int) ([]string, error) {
+	// Initialize sums and counts on the first row if they have not been initialized
+	if p.sums == nil || p.counts == nil {
+		// Determine the columns to process: either specified columns or all columns
+		if len(p.columnIndices) == 0 {
+			p.columnIndices = make([]int, len(row)) // If no columns specified, use all columns
+			for i := range row {
+				p.columnIndices[i] = i
+			}
+		}
+		// Initialize sums and counts based on the size of columnIndices
+		p.sums = make([]int, len(p.columnIndices))
+		p.counts = make([]int, len(p.columnIndices))
+	}
+
+	// Process each specified column
+	for i, index := range p.columnIndices {
+		if index < 0 || index >= len(row) { // Check index range
+			continue // Skip out-of-range indices
+		}
+		value, err := strconv.Atoi(row[index])
+		if err != nil {
+			fmt.Printf("Warning: Non-numeric data at row %d, column %d\n", rowIndex, index)
+			continue
+		}
+		p.sums[i] += value
+		p.counts[i]++
+	}
+
+	return row, nil
+}
+
+func (p *AvgProcessor) Finalize() ([]string, error) {
+	averages := make([]float64, len(p.sums))
+	for i, sum := range p.sums {
+		if p.counts[i] == 0 {
+			averages[i] = 0 // Avoid division by zero
+		} else {
+			averages[i] = float64(sum) / float64(p.counts[i])
+		}
+	}
+	strings := float64SliceToStringSlice(averages)
+	return strings, nil
+}
+
+func (p *AvgProcessor) isAggregator() bool {
+	return true
+}
+
+func float64SliceToStringSlice(floats []float64) []string {
+	strings := make([]string, len(floats))
+	for i, v := range floats {
+		// strconv.FormatFloat converts a float64 to a string
+		strings[i] = strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	return strings
+}
+
+type CeilProcessor struct {
+	BaseProcessor
+}
+
+func Ceil() Processor {
+	return &CeilProcessor{}
+}
+
+func (p *CeilProcessor) ProcessRow(row []string, rowIndex int) ([]string, error) {
+	result := make([]string, len(row))
+	for i, val := range row {
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			result[i] = strconv.Itoa(int(math.Ceil(f)))
+		} else {
+			return nil, fmt.Errorf("failed to parse float from string '%s': %v", val, err)
+		}
+	}
+	return result, nil
 }
 
 func main() {
@@ -299,25 +437,27 @@ func main() {
 	//	fmt.Println("Error:", err2)
 	//}
 
-	//err2 := Read("main/input.csv").
-	//	With(GetRows(1, 5)).
-	//	With(GetColumns(10, 50)).
-	//	//With(ForEveryColumn(func(cell string) string {
-	//	//	n, err := strconv.Atoi(cell)
-	//	//	if err != nil {
-	//	//		return cell // Returning empty string or some default value in case of error
-	//	//	}
-	//	//	return strconv.Itoa(n * 2)
-	//	//})).
-	//	//With(SumRow()).
-	//	With(RowAvg()).
-	//	Write("output.csv")
-
 	err2 := Read("main/input.csv").
 		With(GetRows(1, 5)).
 		With(GetColumns(10, 50)).
+		//With(ForEveryColumn(func(cell string) string {
+		//	n, err := strconv.Atoi(cell)
+		//	if err != nil {
+		//		return cell // Returning empty string or some default value in case of error
+		//	}
+		//	return strconv.Itoa(n * 2)
+		//})).
+		//With(SumRow()).
 		With(RowAvg()).
 		Write("output.csv")
+
+	//err2 := Read("main/input.csv").
+	//	With(GetRows(1, 5)).
+	//	With(GetColumns(10, 50)).
+	//	With(GetAvg()).
+	//	With(Ceil()).
+	//	//With(TopN(lambda x: x[4],10)).
+	//	Write("output.csv")
 
 	if err2 != nil {
 		fmt.Println("Error:", err2)
