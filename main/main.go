@@ -200,7 +200,6 @@ func (p *RowAvgProcessor) ProcessRow(row []string, rowIndex int) ([]string, erro
 			n, err := strconv.Atoi(row[index])
 			if err != nil {
 				return nil, fmt.Errorf("%T Error: non-numeric value found at column %d in row %d", p, index, rowIndex)
-				//fmt.Printf("After processing with %T: Row %d: %v\n", proc, rowIndex, currentRow)
 			}
 			sum += n
 			count++
@@ -277,7 +276,6 @@ func (p *AvgProcessor) ProcessAggregation([][]string) ([][]string, error) {
 		}
 	}
 	strings := float64SliceToStringSlice(averages)
-	// Create a 2D array with 1 row and a number of columns equal to the length of inputRow.
 	resultTable := make([][]string, 1)
 	resultTable[0] = make([]string, len(strings))
 	// Populate the first (and only) row with the data from inputRow.
@@ -456,16 +454,13 @@ func (dp *DataPipeline) Write(outputFilePath string) error {
 		}
 
 		currentRow := inputRow
-		//fmt.Printf("Before processing: Row %d: %v\n", rowIndex, inputRow)
 
 		for proc := dp.processors; proc != nil; proc = proc.Next() {
 			currentRow, err = proc.ProcessRow(currentRow, rowIndex)
 			if err != nil {
 				return err
 			}
-			//fmt.Printf("After processing with %T: Row %d: %v\n", proc, rowIndex, currentRow)
 			if currentRow == nil {
-				//fmt.Printf("Row %d resulted in nil and was skipped\n", rowIndex)
 				break
 			}
 		}
@@ -474,7 +469,6 @@ func (dp *DataPipeline) Write(outputFilePath string) error {
 			if err := writer.Write(currentRow); err != nil {
 				return fmt.Errorf("failed to write row %d: %v", rowIndex, err)
 			}
-			//fmt.Printf("Written to file: Row %d: %v\n", rowIndex, currentRow)
 		}
 
 		rowIndex++
@@ -517,7 +511,7 @@ func main() {
 		With(ForEveryColumn(func(cell string) string {
 			n, err := strconv.Atoi(cell)
 			if err != nil {
-				return cell // Returning empty string or some default value in case of error
+				return cell
 			}
 			return strconv.Itoa(n * 2)
 		})).
